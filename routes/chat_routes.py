@@ -213,6 +213,17 @@ _RECENT_BROWSER_CONTEXT_RE = re.compile(
     r"form\s+submission|playwright|automation)\b",
     re.I,
 )
+# A turn that tells the assistant NOT to use web search ("no web search",
+# "don't search the web") must not be read as a web-lookup request — the
+# bare-keyword _explicit_web_intent scan below would otherwise match "web"/
+# "search" in the denial itself and clamp the tool set down to web-only,
+# stripping shell/file tools the user just asked for (and explicitly enabled).
+_WEB_SEARCH_DENIAL_RE = re.compile(
+    r"\b(?:no|not|don'?t|do\s+not|without|avoid|never|skip)\b(?:\s+\w+){0,4}?\s*"
+    r"\b(?:web\s*search(?:ing)?|search(?:ing)?\s+(?:the\s+|online\s+)?web|"
+    r"browsing|googl(?:e|ing))\b",
+    re.I,
+)
 _BROWSER_MCP_TOOLS = {
     "mcp__builtin_browser__browser_navigate",
     "mcp__builtin_browser__browser_snapshot",
@@ -945,7 +956,7 @@ def setup_chat_routes(
             _explicit_web_intent = bool(re.search(
                 r"\b(search|look\s*up|lookup|google|browse|web|online|latest|current|today|news|weather|forecast|rate|exchange\s+rate)\b",
                 _msg_l,
-            ))
+            )) and not _WEB_SEARCH_DENIAL_RE.search(_msg_l)
             _explicit_browser_intent = bool(re.search(
                 r"\b(browser|browse|open\s+(?:the\s+)?(?:site|page|url|link)|"
                 r"click|fill(?:\s+out)?|submit|send\s+(?:the\s+)?form|"
@@ -1364,12 +1375,20 @@ def setup_chat_routes(
         if allow_bash is not None and str(allow_bash).lower() != "true":
             disabled_tools.add("bash")
         _explicit_web_intent = _explicit_web_intent or bool(_tool_intent and _tool_intent.category == "web")
+        # A message can legitimately need both web lookup AND local/workspace
+        # tools in the same turn (e.g. "read requirements.txt, then verify the
+        # version against the official docs, then write a report"). The
+        # web-only clamp below exists for pure lookup/search turns; it must
+        # not fire when the same turn also shows shell/workspace intent, or
+        # it silently deletes the local tools the task actually needs.
+        _local_task_intent = bool(_tool_intent and _tool_intent.category in {"shell", "workspace"})
         if is_web_search_explicitly_denied(allow_web_search) or not _search_enabled:
             disabled_tools.update(WEB_TOOL_NAMES)
-        if _explicit_web_intent:
-            # A direct lookup/search request should not drift into personal
-            # tools or shell fallbacks. It can only use web_search/web_fetch
-            # when the request's explicit web setting enabled them.
+        if _explicit_web_intent and not _local_task_intent:
+            # A direct, web-only lookup/search request should not drift into
+            # personal tools or shell fallbacks. It can only use
+            # web_search/web_fetch when the request's explicit web setting
+            # enabled them.
             disabled_tools.update({
                 "bash", "python",
                 "search_chats", "manage_skills", "manage_memory",

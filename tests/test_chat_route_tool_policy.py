@@ -9,6 +9,7 @@ Fix: (1) Read from JSON body as fallback.
 """
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -137,6 +138,7 @@ def _build_disabled_tools(
     can_use_bash=True,
     can_use_browser=True,
     explicit_web_intent=False,
+    local_task_intent=False,
     global_disabled=None,
 ):
     """Replicate the disabled-tools logic from chat_stream for unit testing.
@@ -151,7 +153,7 @@ def _build_disabled_tools(
     search_enabled = web_search_enabled_for_turn(allow_web_search, use_web)
     if is_web_search_explicitly_denied(allow_web_search) or not search_enabled:
         disabled_tools.update(WEB_TOOL_NAMES)
-    if explicit_web_intent:
+    if explicit_web_intent and not local_task_intent:
         disabled_tools.update({
             "bash", "python",
             "search_chats", "manage_skills", "manage_memory",
@@ -296,6 +298,157 @@ def test_global_disabled_web_wins_over_explicit_web_enable():
     )
     assert "web_search" in disabled
     assert "web_fetch" in disabled
+
+
+def test_web_search_denial_regex_exists_and_guards_explicit_web_intent():
+    """Source guard: the crude keyword scan that sets _explicit_web_intent
+    must be gated by a denial-aware regex, or a turn that tells the agent
+    NOT to use web search (which still contains the bare words "web"/
+    "search") gets misread as a web-lookup request and clamps bash/python/
+    read_file/write_file off — even when those tools were explicitly
+    enabled and the message asked for a workspace/file task.
+    """
+    source = _CHAT_ROUTES.read_text(encoding="utf-8")
+    assert "_WEB_SEARCH_DENIAL_RE" in source
+    assert "not _WEB_SEARCH_DENIAL_RE.search(_msg_l)" in source
+
+
+def test_web_search_denial_regex_matches_common_negations():
+    """The denial regex itself must catch the common ways a user tells the
+    agent not to search the web, without over-matching a genuine request.
+    """
+    from routes.chat_routes import _WEB_SEARCH_DENIAL_RE
+
+    denials = [
+        "Inspect the workspace and read requirements.txt. Do not use web search.",
+        "Please read requirements.txt. No web search allowed, no writes.",
+        "Don't search the web for this, just check the local files.",
+        "without doing a web search, summarize the repo",
+    ]
+    for message in denials:
+        assert _WEB_SEARCH_DENIAL_RE.search(message.lower()), message
+
+    allowed = [
+        "search the web for the current weather in Boston",
+        "please look it up online",
+        "what's the latest exchange rate for USD to EUR",
+    ]
+    for message in allowed:
+        assert not _WEB_SEARCH_DENIAL_RE.search(message.lower()), message
+
+
+def test_workspace_prompt_denying_web_search_keeps_shell_and_file_tools():
+    """End-to-end regression for the reported bug: a workspace/file-inspection
+    prompt that explicitly says "no web search" must not clamp bash/python/
+    read_file/write_file down to web-only, since the literal word "web"
+    appears only inside the denial.
+    """
+    from routes.chat_routes import _WEB_SEARCH_DENIAL_RE
+
+    message = (
+        "Inspect the active workspace and read requirements.txt. "
+        "Do not use web search. Do not write any files."
+    )
+    msg_l = message.lower()
+    explicit_web_intent = bool(re.search(
+        r"\b(search|look\s*up|lookup|google|browse|web|online|latest|current|today|news|weather|forecast|rate|exchange\s+rate)\b",
+        msg_l,
+    )) and not _WEB_SEARCH_DENIAL_RE.search(msg_l)
+    assert explicit_web_intent is False
+
+    disabled = _build_disabled_tools(
+        allow_web_search="true",
+        can_use_bash=True,
+        explicit_web_intent=explicit_web_intent,
+    )
+    assert "bash" not in disabled
+    assert "python" not in disabled
+    assert "read_file" not in disabled
+
+
+def test_local_task_intent_guard_exists_on_web_only_clamp():
+    """Source guard: the web-only clamp (ODY-TOOL-ROUTING-02) must not fire
+    when the same turn also shows shell/workspace intent, or a legitimate
+    mixed local+web task (read a file, verify something on the web, write a
+    report) loses its local/code tools even though they're enabled.
+    """
+    source = _CHAT_ROUTES.read_text(encoding="utf-8")
+    assert "_local_task_intent" in source
+    assert 'if _explicit_web_intent and not _local_task_intent:' in source
+
+
+def test_web_only_positive_intent_still_clamps_to_web_tools():
+    """A genuine web-only lookup (no local/workspace signal) keeps the
+    existing, intentional web-only restriction.
+    """
+    from src.action_intents import classify_tool_intent
+
+    message = "Search the web for the latest Python release."
+    intent = classify_tool_intent(message)
+    local_task_intent = bool(intent and intent.category in {"shell", "workspace"})
+    assert local_task_intent is False
+
+    disabled = _build_disabled_tools(
+        allow_web_search="true",
+        can_use_bash=True,
+        explicit_web_intent=True,
+        local_task_intent=local_task_intent,
+    )
+    assert "bash" in disabled
+    assert "python" in disabled
+    assert "read_file" in disabled
+    assert "web_search" not in disabled
+
+
+def test_mixed_local_and_web_intent_keeps_both_tool_sets():
+    """ODY-TOOL-ROUTING-02 regression: a mixed task (read local file, verify
+    something via an authoritative web source, write a report) must keep
+    bash/python/read_file/write_file AND web_search — not collapse to
+    web_search only.
+    """
+    from src.action_intents import classify_tool_intent
+
+    message = (
+        "Read requirements.txt from the workspace, calculate the required "
+        "value, verify the Python version using official web documentation, "
+        "and write final_report.txt."
+    )
+    intent = classify_tool_intent(message)
+    assert intent.category in {"shell", "workspace"}, intent
+    local_task_intent = True
+    explicit_web_intent = bool(re.search(
+        r"\b(search|look\s*up|lookup|google|browse|web|online|latest|current|today|news|weather|forecast|rate|exchange\s+rate)\b",
+        message.lower(),
+    ))
+    assert explicit_web_intent is True  # message mentions "web documentation"
+
+    disabled = _build_disabled_tools(
+        allow_web_search="true",
+        can_use_bash=True,
+        explicit_web_intent=explicit_web_intent,
+        local_task_intent=local_task_intent,
+    )
+    assert "bash" not in disabled
+    assert "python" not in disabled
+    assert "read_file" not in disabled
+    assert "write_file" not in disabled
+    assert "web_search" not in disabled
+
+
+def test_mixed_intent_does_not_override_explicitly_disabled_tool():
+    """A tool the admin/user explicitly disabled must stay disabled even for
+    a mixed local+web task — mixed-intent routing must not widen access.
+    """
+    disabled = _build_disabled_tools(
+        allow_web_search="true",
+        can_use_bash=True,
+        explicit_web_intent=True,
+        local_task_intent=True,
+        global_disabled=["write_file"],
+    )
+    assert "write_file" in disabled
+    assert "bash" not in disabled
+    assert "read_file" not in disabled
 
 
 def test_form_data_none_body_true_works():
